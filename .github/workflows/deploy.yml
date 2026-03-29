@@ -1,0 +1,87 @@
+name: Build, Test & Deploy to Yandex Cloud
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY_ID: ${{ secrets.YC_REGISTRY_ID }}
+  IMAGE_NAME: mlops-app
+  CONTAINER_NAME: mlops-container
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Yandex Cloud CLI
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+
+      - name: Authenticate in Yandex Cloud
+        run: |
+          echo '${{ secrets.YC_SA_JSON_CREDENTIALS }}' > key.json
+          yc config set service-account-key key.json
+          yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+
+      - name: Login to Container Registry
+        run: yc container registry configure-docker
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG=cr.yandex/$REGISTRY_ID/$IMAGE_NAME:${{ github.sha }}
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+
+      - name: Deploy to Serverless Containers
+        run: |
+          IMAGE_TAG=cr.yandex/$REGISTRY_ID/$IMAGE_NAME:${{ github.sha }}
+          if yc serverless container get --name $CONTAINER_NAME &>/dev/null; then
+            yc serverless container revision deploy \
+              --container-name $CONTAINER_NAME \
+              --image $IMAGE_TAG \
+              --cores 1 \
+              --memory 512MB \
+              --concurrency 4 \
+              --execution-timeout 30s \
+              --service-account-id $(yc iam service-account get mlops-deployer --format json | jq -r '.id')
+          else
+            yc serverless container create --name $CONTAINER_NAME
+            yc serverless container revision deploy \
+              --container-name $CONTAINER_NAME \
+              --image $IMAGE_TAG \
+              --cores 1 \
+              --memory 512MB \
+              --concurrency 4 \
+              --execution-timeout 30s \
+              --service-account-id $(yc iam service-account get mlops-deployer --format json | jq -r '.id')
+          fi
+
+      - name: Make container public
+        run: yc serverless container allow-unauthenticated-invoke --name $CONTAINER_NAME
+
+      - name: Print endpoint URL
+        run: |
+          yc serverless container get --name $CONTAINER_NAME --format json | jq -r '.url'
